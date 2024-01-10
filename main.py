@@ -7,7 +7,51 @@ import cv2
 import numpy as np
 
 
-def model_loop(shared_mem, dtype, shape, lock: Lock):
+class PipeOut:
+    def __init__(self, shm, shape, dtype, lock):
+        self._shm = shm
+        self._shape = shape
+        self._dtype = dtype
+        self._lock = lock
+
+    def read(self):
+        self._lock.acquire()
+        try:
+            arr = np.frombuffer(self._shm.buf, dtype=self._dtype)
+            return arr.reshape(self._shape)
+        finally:
+            self._lock.release()
+
+
+class PipeIn:
+    def __init__(self, shm, shape, dtype, lock):
+        arr = np.frombuffer(shm.buf, dtype=dtype)
+        arr.reshape(shape)
+        self._arr = arr
+        self._lock = lock
+
+    def write(self, frame):
+        self._lock.acquire()
+        try:
+            self._arr[:] = frame.flatten()
+        finally:
+            self._lock.release()
+
+
+def create_pipe(shape, dtype, itemsize):
+    d_size = itemsize * np.prod(shape)
+    shm = SharedMemory(create=True, size=d_size, name="video_shared")
+
+    def destructor():
+        shm.close()
+        shm.unlink()
+
+    lock = Lock()
+
+    return PipeIn(shm, shape, dtype, lock), PipeOut(shm, shape, dtype, lock), destructor
+
+
+def model_loop(pipe_out: PipeOut, shape):
     height, width = shape[:2]
     video_out = cv2.VideoWriter(f'out/model_{int(time.time())}.mp4', cv2.VideoWriter_fourcc(*'mp4v'), 1.0,
                                 (width, height))
@@ -20,13 +64,8 @@ def model_loop(shared_mem, dtype, shape, lock: Lock):
                 continue
 
             try:
-                lock.acquire()
-                try:
-                    arr = np.frombuffer(shared_mem.buf, dtype=dtype)
-                    frame = arr.reshape(shape)
-                    video_out.write(frame)
-                finally:
-                    lock.release()
+                frame = pipe_out.read()
+                video_out.write(frame)
             except Exception as e:
                 print(e)
             finally:
@@ -40,9 +79,7 @@ def video_loop():
 
     video_out = None
     model_process = None
-    shm = None
-    shm_buf = None
-    lock = Lock()
+    pipe_in, pipe_out, destructor = None, None, None
 
     try:
         while cap.isOpened():
@@ -52,18 +89,12 @@ def video_loop():
                 height, width = frame.shape[:2]
                 video_out = cv2.VideoWriter(f'out/main_{int(time.time())}.mp4', cv2.VideoWriter_fourcc(*'mp4v'), 20.0,
                                             (width, height))
-            if not shm:
-                d_size = frame.itemsize * np.prod(frame.shape)
-                shm = SharedMemory(create=True, size=d_size, name="video_shared")
-                shm_buf = np.ndarray(shape=frame.shape, dtype=frame.dtype, buffer=shm.buf)
-                model_process = Process(target=model_loop, args=(shm, frame.dtype, frame.shape, lock))
+            if not pipe_in and not pipe_out and not destructor:
+                pipe_in, pipe_out, destructor = create_pipe(frame.shape, frame.dtype, frame.itemsize)
+                model_process = Process(target=model_loop, args=(pipe_out, frame.shape))
                 model_process.start()
 
-            lock.acquire()
-            try:
-                shm_buf[:] = frame[:]
-            finally:
-                lock.release()
+            pipe_in.write(frame)
 
             video_out.write(frame)
     finally:
@@ -72,8 +103,7 @@ def video_loop():
             video_out.release()
         if model_process:
             model_process.terminate()
-        if shm:
-            shm.close()
+        destructor()
 
 
 def main():
